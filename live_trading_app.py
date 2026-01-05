@@ -1,8 +1,3 @@
-# ====================================================
-# LIVE AI TRADING ENGINE V3 - SAFE INDENTATION
-# 16 TRHŮ, ATR+SPREAD, ADAPTIVE LEARNING, CORRELATION FILTER
-# ====================================================
-
 import os
 from datetime import datetime
 import pandas as pd
@@ -11,173 +6,123 @@ import yfinance as yf
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from sklearn.ensemble import RandomForestClassifier
-import sqlite3
 import streamlit as st
 
-# ====================================================
-# SETTINGS
-# ====================================================
-ACCOUNT_BALANCE = 5000          # CZK
-RISK_PER_TRADE = 0.015          # 1.5%
-PROB_THRESHOLD = 0.8            # only signals >80%
-LOOKBACK_DAYS = 60
-INTERVAL = "30m"
+# ============================
+# SLOŽKY
+# ============================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-MARKETS = {
-    "JP225": "JPY=X",
-    "US100": "NDX",
-    "US500": "SPY",
-    "US30": "DJI",
-    "DE40": "DAX",
-    "EU50": "^STOXX50E",
-    "UK100": "^FTSE",
-    "FRA40": "^FCHI",
-    "SPA35": "^IBEX",
-    "SWI20": "^SSMI",
-    "GOLD": "GC=F",
-    "SILVER": "SI=F",
-    "OIL": "CL=F",
-    "NATGAS": "NG=F",
-    "COCOA": "CC=F",
-    "COPPER": "HG=F"
-}
+# ============================
+# NASTAVENÍ TRHŮ
+# ============================
+instruments = ["^N225", "EUR=X", "CC=F", "SI=F"]  # JP225, EU50, COCOA, SILVER
+interval = "30m"
+lookback_days = 30
+trade_risks = [1678, 710, 1215, 7479]  # CZK na obchod
+prob_threshold = 80  # filtr silných signálů ≥80 %
 
-DB_PATH = "trade_memory.db"
-conn = sqlite3.connect(DB_PATH)
-c = conn.cursor()
-c.execute(
-    '''CREATE TABLE IF NOT EXISTS trades
-       (time TEXT, market TEXT, signal TEXT, prob REAL,
-        sl REAL, tp REAL, profit REAL)'''
-)
-conn.commit()
+# ============================
+# STREAMLIT UI
+# ============================
+st.title("Live CFD AI Trading Signals")
+st.write(f"Aktuální silné signály (pravděpodobnost ≥ {prob_threshold}%)")
 
-# ====================================================
-# FETCH MARKET DATA
-# ====================================================
-def get_data(symbol):
+# ============================
+# FUNKCE PRO VÝPOČET SIGNÁLU
+# ============================
+def get_signal(symbol, trade_risk_czk):
     try:
-        df = yf.download(symbol, period=f"{LOOKBACK_DAYS}d", interval=INTERVAL)
-        df = df.dropna()
-        return df
-    except:
-        return None
+        # stažení dat
+        data = yf.download(symbol, period=f"{lookback_days}d", interval=interval)
+        if data.empty:
+            return {"instrument": symbol, "error": "no data"}
+        close = data['Close'].squeeze()
 
-# ====================================================
-# CALCULATE INDICATORS + FEATURES
-# ====================================================
-def calc_features(df):
-    close = df['Close'].squeeze()
-    df['EMA10'] = EMAIndicator(close, window=10).ema_indicator()
-    df['EMA50'] = EMAIndicator(close, window=50).ema_indicator()
-    df['RSI'] = RSIIndicator(close, window=14).rsi()
-    macd = MACD(close)
-    df['MACD'] = macd.macd()
-    df['MACD_signal'] = macd.macd_signal()
-    df['EMA_diff'] = df['EMA10'] - df['EMA50']
-    df['MACD_diff'] = df['MACD'] - df['MACD_signal']
-    features = df[['EMA_diff', 'RSI', 'MACD_diff']].fillna(0)
-    df['target'] = np.where(df['Close'].shift(-1) > df['Close'], 1, -1)
-    return df, features
+        # indikátory
+        data['EMA10'] = EMAIndicator(close, window=10).ema_indicator()
+        data['EMA50'] = EMAIndicator(close, window=50).ema_indicator()
+        data['RSI'] = RSIIndicator(close, window=14).rsi()
+        macd = MACD(close)
+        data['MACD'] = macd.macd()
+        data['MACD_signal'] = macd.macd_signal()
+        data['EMA_diff'] = data['EMA10'] - data['EMA50']
+        data['MACD_diff'] = data['MACD'] - data['MACD_signal']
 
-# ====================================================
-# CALCULATE ATR-BASED SL/TP
-# ====================================================
-def calc_sl_tp(df, latest_close, direction):
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().iloc[-1]
+        features = data[['EMA_diff', 'RSI', 'MACD_diff']].fillna(0)
+        data['target'] = np.where(data['Close'].shift(-1) > data['Close'], 1, -1)
 
-    spread = 0  # optional: vložit spread XTB
-    buffer = atr * 0.5 + spread
+        # model
+        model = RandomForestClassifier(n_estimators=150, random_state=42)
+        model.fit(features, data['target'])
 
-    if direction == "LONG":
-        sl = latest_close - buffer
-        tp = latest_close + buffer * 3
-    elif direction == "SHORT":
-        sl = latest_close + buffer
-        tp = latest_close - buffer * 3
+        latest = features.iloc[-1].values.reshape(1, -1)
+        proba = model.predict_proba(latest)[0]
+        signal = "LONG" if proba[1] > 0.6 else "SHORT" if proba[0] > 0.6 else "HOLD"
+        latest_close = float(data['Close'].iloc[-1])
+        probability_percent = max(proba) * 100
+
+        # filtr podle pravděpodobnosti
+        if probability_percent < prob_threshold:
+            return None  # slabý signál, ignorujeme
+
+        # stop loss / take profit
+        if signal == "LONG":
+            sl = latest_close * 0.995  # -0.5%
+            tp = latest_close * 1.015  # +1.5%
+        elif signal == "SHORT":
+            sl = latest_close * 1.005  # +0.5%
+            tp = latest_close * 0.985  # -1.5%
+        else:
+            sl = None
+            tp = None
+
+        # bezpečný výpočet profit_CZK
+        if tp is not None and sl is not None:
+            profit_CZK = abs(tp - latest_close) / latest_close * trade_risk_czk * 1000
+        else:
+            profit_CZK = None
+
+        return {
+            "instrument": symbol,
+            "price": latest_close,
+            "signal": signal,
+            "SL": sl,
+            "TP": tp,
+            "probability": probability_percent,
+            "profit_CZK": profit_CZK
+        }
+
+    except Exception as e:
+        return {"instrument": symbol, "error": str(e)}
+
+# ============================
+# GENEROVÁNÍ SIGNÁLŮ
+# ============================
+results = []
+for i, instrument in enumerate(instruments):
+    result = get_signal(instrument, trade_risks[i])
+    if result is not None:  # filtr silných signálů
+        results.append(result)
+
+# ============================
+# STREAMLIT ZOBRAZENÍ
+# ============================
+if results:
+    df_results = pd.DataFrame(results)
+    st.table(df_results)
+
+    # ============================
+    # ULOŽENÍ HISTORIE
+    # ============================
+    csv_path = os.path.join(DATA_DIR, "signals_history.csv")
+    if os.path.exists(csv_path):
+        df_results.to_csv(csv_path, mode="a", header=False, index=False)
     else:
-        sl, tp = None, None
-    return sl, tp
+        df_results.to_csv(csv_path, index=False)
 
-# ====================================================
-# TRAIN MODEL & PREDICT
-# ====================================================
-def get_signal(features, df):
-    model = RandomForestClassifier(n_estimators=150, random_state=42)
-    model.fit(features, df['target'])
-    latest = features.iloc[-1].values.reshape(1, -1)
-    proba = model.predict_proba(latest)[0]
-    if proba[1] > PROB_THRESHOLD:
-        signal = "LONG"
-    elif proba[0] > PROB_THRESHOLD:
-        signal = "SHORT"
-    else:
-        signal = "HOLD"
-    return signal, max(proba)
-
-# ====================================================
-# FILTER TOP 3 CORRELATED SIGNALS
-# ====================================================
-def filter_correlated(signals_df):
-    signals_df = signals_df.sort_values(by="prob", ascending=False)
-    if len(signals_df) > 3:
-        signals_df = signals_df.iloc[:3]
-    return signals_df
-
-# ====================================================
-# MAIN LOOP: SCAN MARKETS
-# ====================================================
-signals = []
-
-for market, symbol in MARKETS.items():
-    df = get_data(symbol)
-    if df is None or len(df) < 50:
-        continue
-    df, features = calc_features(df)
-    signal, prob = get_signal(features, df)
-    if signal == "HOLD":
-        continue
-    latest_close = df['Close'].iloc[-1]
-    sl, tp = calc_sl_tp(df, latest_close, signal)
-
-    trade_risk_czk = ACCOUNT_BALANCE * RISK_PER_TRADE
-    potential_profit_czk = None
-    if sl is not None and tp is not None:
-        potential_profit_czk = abs(tp - latest_close) / latest_close * trade_risk_czk * 1000
-
-    signals.append({
-        "market": market,
-        "signal": signal,
-        "prob": round(prob*100, 1),
-        "sl": round(sl, 2),
-        "tp": round(tp, 2),
-        "profit_czk": round(potential_profit_czk, 2) if potential_profit_czk is not None and not np.isnan(latest_close)
-    })
-
-    # Store in DB
-    c.execute(
-        'INSERT INTO trades VALUES (?,?,?,?,?,?,?)',
-        (str(datetime.now()), market, signal, prob, sl, tp, potential_profit_czk)
-    )
-    conn.commit()
-
-# Apply correlation filter / max top 3 signals
-if signals:
-    df_signals = pd.DataFrame(signals)
-    df_signals = filter_correlated(df_signals)
-
-# ====================================================
-# STREAMLIT DISPLAY
-# ====================================================
-st.title("🔥 LIVE AI TRADING SIGNALS V3 🔥")
-if signals:
-    st.table(df_signals)
+    st.write("📈 Signály zpracovány a uloženy!")
 else:
-    st.info("Žádné silné signály nad threshold pro aktuální data.")
-
-conn.close()
-
+    st.write("Žádné silné signály pro dnešní data.")

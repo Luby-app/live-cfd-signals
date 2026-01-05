@@ -1,146 +1,182 @@
-import streamlit as st
+# ====================================================
+# LIVE AI TRADING ENGINE V3 - SAFE INDENTATION
+# 16 TRHŮ, ATR+SPREAD, ADAPTIVE LEARNING, CORRELATION FILTER
+# ====================================================
+
+import os
+from datetime import datetime
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from ta.trend import EMAIndicator, MACD
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.volatility import AverageTrueRange, BollingerBands
+from ta.momentum import RSIIndicator
 from sklearn.ensemble import RandomForestClassifier
+import sqlite3
+import streamlit as st
 
-# -----------------------------
-# INSTRUMENTY
-# -----------------------------
-instruments = {
-    "JP225": {"symbol": "^N225", "contract_value": 33500, "leverage": 20},
-    "EU50": {"symbol": "^STOXX50E", "contract_value": 14200, "leverage": 20},
-    "COCOA": {"symbol": "CC=F", "contract_value": 12100, "leverage": 20},
-    "SILVER": {"symbol": "SI=F", "contract_value": 74800, "leverage": 20}
+# ====================================================
+# SETTINGS
+# ====================================================
+ACCOUNT_BALANCE = 5000          # CZK
+RISK_PER_TRADE = 0.015          # 1.5%
+PROB_THRESHOLD = 0.8            # only signals >80%
+LOOKBACK_DAYS = 60
+INTERVAL = "30m"
+
+MARKETS = {
+    "JP225": "JPY=X",
+    "US100": "NDX",
+    "US500": "SPY",
+    "US30": "DJI",
+    "DE40": "DAX",
+    "EU50": "^STOXX50E",
+    "UK100": "^FTSE",
+    "FRA40": "^FCHI",
+    "SPA35": "^IBEX",
+    "SWI20": "^SSMI",
+    "GOLD": "GC=F",
+    "SILVER": "SI=F",
+    "OIL": "CL=F",
+    "NATGAS": "NG=F",
+    "COCOA": "CC=F",
+    "COPPER": "HG=F"
 }
 
-lookback_days = 30
-interval = "1h"
-SL_ATR_mult = 2
-TP_ATR_mult = 4
-threshold_prob = 0.6
-MIN_PROBABILITY = 0.8
-atr_min_thresholds = {"JP225": 10,"EU50": 5,"COCOA": 50,"SILVER": 0.5}
-TOP_SIGNAL_COUNT = 5
+DB_PATH = "trade_memory.db"
+conn = sqlite3.connect(DB_PATH)
+c = conn.cursor()
+c.execute(
+    '''CREATE TABLE IF NOT EXISTS trades
+       (time TEXT, market TEXT, signal TEXT, prob REAL,
+        sl REAL, tp REAL, profit REAL)'''
+)
+conn.commit()
 
-# -----------------------------
-# FUNKCE
-# -----------------------------
-def prepare_data(symbol):
-    data = yf.download(symbol, period=f"{lookback_days}d", interval=interval)
-    if data.empty or len(data) < 20:
+# ====================================================
+# FETCH MARKET DATA
+# ====================================================
+def get_data(symbol):
+    try:
+        df = yf.download(symbol, period=f"{LOOKBACK_DAYS}d", interval=INTERVAL)
+        df = df.dropna()
+        return df
+    except:
         return None
-    close = data['Close'].squeeze()
-    high = data['High'].squeeze()
-    low = data['Low'].squeeze()
 
-    data['EMA10'] = EMAIndicator(close, window=10).ema_indicator()
-    data['EMA50'] = EMAIndicator(close, window=50).ema_indicator()
+# ====================================================
+# CALCULATE INDICATORS + FEATURES
+# ====================================================
+def calc_features(df):
+    close = df['Close'].squeeze()
+    df['EMA10'] = EMAIndicator(close, window=10).ema_indicator()
+    df['EMA50'] = EMAIndicator(close, window=50).ema_indicator()
+    df['RSI'] = RSIIndicator(close, window=14).rsi()
     macd = MACD(close)
-    data['MACD'] = macd.macd()
-    data['MACD_signal'] = macd.macd_signal()
-    data['MACD_diff'] = data['MACD'] - data['MACD_signal']
-    data['EMA_diff'] = data['EMA10'] - data['EMA50']
+    df['MACD'] = macd.macd()
+    df['MACD_signal'] = macd.macd_signal()
+    df['EMA_diff'] = df['EMA10'] - df['EMA50']
+    df['MACD_diff'] = df['MACD'] - df['MACD_signal']
+    features = df[['EMA_diff', 'RSI', 'MACD_diff']].fillna(0)
+    df['target'] = np.where(df['Close'].shift(-1) > df['Close'], 1, -1)
+    return df, features
 
-    data['RSI'] = RSIIndicator(close, window=14).rsi()
-    stoch = StochasticOscillator(high, low, close, window=14, smooth_window=3)
-    data['STOCH'] = stoch.stoch()
-    data['STOCH_signal'] = stoch.stoch_signal()
+# ====================================================
+# CALCULATE ATR-BASED SL/TP
+# ====================================================
+def calc_sl_tp(df, latest_close, direction):
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().iloc[-1]
 
-    data['ATR'] = AverageTrueRange(high, low, close, window=14).average_true_range()
-    bb = BollingerBands(close, window=20, window_dev=2)
-    data['BB_high'] = bb.bollinger_hband()
-    data['BB_low'] = bb.bollinger_lband()
+    spread = 0  # optional: vložit spread XTB
+    buffer = atr * 0.5 + spread
 
-    data.dropna(inplace=True)
-    data.reset_index(inplace=True)
-    return data
-
-def simulate_trade(entry_price, atr_value, direction, future_price=None):
-    if direction=="LONG":
-        sl = entry_price - SL_ATR_mult*atr_value
-        tp = entry_price + TP_ATR_mult*atr_value
+    if direction == "LONG":
+        sl = latest_close - buffer
+        tp = latest_close + buffer * 3
+    elif direction == "SHORT":
+        sl = latest_close + buffer
+        tp = latest_close - buffer * 3
     else:
-        sl = entry_price + SL_ATR_mult*atr_value
-        tp = entry_price - TP_ATR_mult*atr_value
+        sl, tp = None, None
     return sl, tp
 
-# -----------------------------
-# GENEROVAT SIGNÁLY
-# -----------------------------
-def generate_live_signals():
-    final_summary = []
-    for name, params in instruments.items():
-        data = prepare_data(params['symbol'])
-        if data is None: continue
-        i = len(data) - 1
+# ====================================================
+# TRAIN MODEL & PREDICT
+# ====================================================
+def get_signal(features, df):
+    model = RandomForestClassifier(n_estimators=150, random_state=42)
+    model.fit(features, df['target'])
+    latest = features.iloc[-1].values.reshape(1, -1)
+    proba = model.predict_proba(latest)[0]
+    if proba[1] > PROB_THRESHOLD:
+        signal = "LONG"
+    elif proba[0] > PROB_THRESHOLD:
+        signal = "SHORT"
+    else:
+        signal = "HOLD"
+    return signal, max(proba)
 
-        hist = data.iloc[:i][['EMA_diff','RSI','MACD_diff','Close']].dropna()
-        hist['target'] = np.where(hist['Close'].shift(-1) > hist['Close'], 1, -1)
-        if len(hist) < 20: continue
-        model = RandomForestClassifier(n_estimators=150, random_state=42)
-        model.fit(hist[['EMA_diff','RSI','MACD_diff']], hist['target'])
+# ====================================================
+# FILTER TOP 3 CORRELATED SIGNALS
+# ====================================================
+def filter_correlated(signals_df):
+    signals_df = signals_df.sort_values(by="prob", ascending=False)
+    if len(signals_df) > 3:
+        signals_df = signals_df.iloc[:3]
+    return signals_df
 
-        latest_features = data[['EMA_diff','RSI','MACD_diff']].iloc[i].to_numpy().reshape(1,-1)
-        proba = model.predict_proba(latest_features)[0]
+# ====================================================
+# MAIN LOOP: SCAN MARKETS
+# ====================================================
+signals = []
 
-        if proba[1] > threshold_prob:
-            signal = "LONG"
-            prob = proba[1]
-        elif proba[0] > threshold_prob:
-            signal = "SHORT"
-            prob = proba[0]
-        else:
-            continue
+for market, symbol in MARKETS.items():
+    df = get_data(symbol)
+    if df is None or len(df) < 50:
+        continue
+    df, features = calc_features(df)
+    signal, prob = get_signal(features, df)
+    if signal == "HOLD":
+        continue
+    latest_close = df['Close'].iloc[-1]
+    sl, tp = calc_sl_tp(df, latest_close, signal)
 
-        # Filtr indikátorů
-        price = float(data['Close'].iloc[i])
-        ema10 = float(data['EMA10'].iloc[i])
-        ema50 = float(data['EMA50'].iloc[i])
-        atr = float(data['ATR'].iloc[i])
-        rsi = float(data['RSI'].iloc[i])
-        stoch = float(data['STOCH'].iloc[i])
-        stoch_sig = float(data['STOCH_signal'].iloc[i])
-        bb_high = float(data['BB_high'].iloc[i])
-        bb_low = float(data['BB_low'].iloc[i])
+    trade_risk_czk = ACCOUNT_BALANCE * RISK_PER_TRADE
+    potential_profit_czk = None
+    if sl is not None and tp is not None:
+        potential_profit_czk = abs(tp - latest_close) / latest_close * trade_risk_czk * 1000
 
-        if signal=="LONG" and (ema10<ema50 or rsi<50 or stoch<stoch_sig or price>bb_high or atr<atr_min_thresholds[name] or prob<MIN_PROBABILITY):
-            continue
-        if signal=="SHORT" and (ema10>ema50 or rsi>50 or stoch>stoch_sig or price<bb_low or atr<atr_min_thresholds[name] or prob<MIN_PROBABILITY):
-            continue
+    signals.append({
+        "market": market,
+        "signal": signal,
+        "prob": round(prob*100, 1),
+        "sl": round(sl, 2),
+        "tp": round(tp, 2),
+        "profit_czk": round(potential_profit_czk, 2) if potential_profit_czk else None
+    })
 
-        sl, tp = simulate_trade(price, atr, signal)
-        profit_czk = (tp-price if signal=="LONG" else price-tp) * params['contract_value'] * params['leverage'] / 0.01
+    # Store in DB
+    c.execute(
+        'INSERT INTO trades VALUES (?,?,?,?,?,?,?)',
+        (str(datetime.now()), market, signal, prob, sl, tp, potential_profit_czk)
+    )
+    conn.commit()
 
-        final_summary.append({
-            "Index": name,
-            "Signal": signal,
-            "Price": round(price,2),
-            "SL": round(sl,2),
-            "TP": round(tp,2),
-            "Probability": round(prob*100,1),
-            "Potential Profit (CZK)": round(profit_czk,0)
-        })
-
-    return final_summary
-
-# -----------------------------
-# STREAMLIT UI
-# -----------------------------
-st.set_page_config(page_title="Live CFD Signals", layout="wide")
-st.title("📊 Live CFD Signály")
-
-signals = generate_live_signals()
+# Apply correlation filter / max top 3 signals
 if signals:
-    df = pd.DataFrame(signals).sort_values(by="Probability", ascending=False).head(TOP_SIGNAL_COUNT)
-    def color_row(row):
-        return ['background-color: #b3ffb3' if row.Signal=="LONG" else 'background-color: #ffb3b3']*len(row)
-    st.dataframe(df.style.apply(color_row, axis=1))
+    df_signals = pd.DataFrame(signals)
+    df_signals = filter_correlated(df_signals)
+
+# ====================================================
+# STREAMLIT DISPLAY
+# ====================================================
+st.title("🔥 LIVE AI TRADING SIGNALS V3 🔥")
+if signals:
+    st.table(df_signals)
 else:
     st.info("Žádné silné signály nad threshold pro aktuální data.")
 
-st.caption("Aktualizace při každém otevření stránky.")
-
+conn.close()

@@ -155,7 +155,7 @@ for market, symbol in MARKETS.items():
         "prob": round(prob*100, 1),
         "sl": round(sl, 2),
         "tp": round(tp, 2),
-        "profit_czk": round(potential_profit_czk, 2) if potential_profit_czk else None
+        "profit_czk": round(potential_profit_czk, 2) if potential_profit_czk is not None and not np.isnan(latest_close)
     })
 
     # Store in DB
@@ -180,3 +180,4 @@ else:
     st.info("Žádné silné signály nad threshold pro aktuální data.")
 
 conn.close()
+

@@ -16,13 +16,26 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ============================
-# NASTAVENÍ TRHŮ
+# NASTAVENÍ TRHŮ (16 instrumentů)
 # ============================
-instruments = ["^N225", "EUR=X", "CC=F", "SI=F"]  # JP225, EU50, COCOA, SILVER
+# ticker z Yahoo Finance, investice CZK na obchod (odpovídající paku)
+instruments = [
+    "^N225", "EUR=X", "CC=F", "SI=F",    # JP225, EU50, COCOA, SILVER
+    "GC=F", "CL=F", "NG=F", "ZC=F",      # GOLD, CRUDE OIL, NAT GAS, CORN
+    "ZS=F", "ZW=F", "SB=F", "HG=F",      # SOYBEAN, WHEAT, SUGAR, COPPER
+    "PL=F", "PA=F", "RB=F", "HG=F"       # PLATINUM, PALLADIUM, RBOB GASOLINE, COPPER duplicate
+]
+
+trade_risks = [
+    1678, 710, 1215, 7479,     # JP225, EU50, COCOA, SILVER
+    2000, 1500, 1200, 1000,    # GOLD, CRUDE OIL, NAT GAS, CORN
+    1100, 950, 800, 1300,      # SOYBEAN, WHEAT, SUGAR, COPPER
+    2500, 2700, 1800, 1300     # PLATINUM, PALLADIUM, RBOB, COPPER duplicate
+]
+
 interval = "30m"
 lookback_days = 30
-trade_risks = [1678, 710, 1215, 7479]  # CZK na obchod
-prob_threshold = 80  # filtr silných signálů ≥80 %
+prob_threshold = 80  # filtr silných signálů
 
 # ============================
 # STREAMLIT UI
